@@ -1,0 +1,455 @@
+# Market Data Service - Part 2: Database Models & FastAPI Core
+
+## Step 1: Create Database Models
+
+Create `app/models/base.py`:
+```python
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
+
+Base = declarative_base()
+
+
+class TimestampMixin:
+    """Mixin for timestamp fields"""
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UUIDMixin:
+    """Mixin for UUID primary key"""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+```
+
+Create `app/models/market_data.py`:
+```python
+from sqlalchemy import Column, String, Numeric, DateTime, Integer, Text, Index
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from .base import Base, TimestampMixin, UUIDMixin
+import uuid
+
+
+class RawMarketDataResponse(Base, UUIDMixin, TimestampMixin):
+    """Store raw responses from market data providers"""
+    __tablename__ = "raw_market_data_responses"
+    
+    symbol = Column(String(10), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    raw_response = Column(JSONB, nullable=False)
+    response_time_ms = Column(Integer)
+    
+    __table_args__ = (
+        Index('ix_raw_data_symbol_created', 'symbol', 'created_at'),
+        Index('ix_raw_data_provider_created', 'provider', 'created_at'),
+    )
+
+
+class ProcessedPricePoint(Base, UUIDMixin, TimestampMixin):
+    """Store processed price points"""
+    __tablename__ = "processed_price_points"
+    
+    symbol = Column(String(10), nullable=False, index=True)
+    price = Column(Numeric(12, 4), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    raw_response_id = Column(UUID(as_uuid=True), nullable=True)
+    volume = Column(Numeric(15, 0), nullable=True)
+    
+    __table_args__ = (
+        Index('ix_price_symbol_timestamp', 'symbol', 'timestamp'),
+        Index('ix_price_provider_timestamp', 'provider', 'timestamp'),
+    )
+
+
+class MovingAverage(Base, UUIDMixin, TimestampMixin):
+    """Store calculated moving averages"""
+    __tablename__ = "moving_averages"
+    
+    symbol = Column(String(10), nullable=False, index=True)
+    period = Column(Integer, nullable=False, default=5)
+    average_price = Column(Numeric(12, 4), nullable=False)
+    calculation_timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    sample_count = Column(Integer, nullable=False)
+    
+    __table_args__ = (
+        Index('ix_ma_symbol_period_calc_time', 'symbol', 'period', 'calculation_timestamp'),
+    )
+
+
+class PollingJobConfig(Base, UUIDMixin, TimestampMixin):
+    """Store polling job configurations"""
+    __tablename__ = "polling_job_configs"
+    
+    job_id = Column(String(50), unique=True, nullable=False, index=True)
+    symbols = Column(JSONB, nullable=False)  # List of symbols
+    interval_seconds = Column(Integer, nullable=False)
+    provider = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False, default='active')  # active, paused, stopped
+    last_poll_at = Column(DateTime(timezone=True), nullable=True)
+    error_count = Column(Integer, default=0)
+    max_errors = Column(Integer, default=10)
+    
+    __table_args__ = (
+        Index('ix_polling_status_interval', 'status', 'interval_seconds'),
+    )
+```
+
+Create `app/models/__init__.py`:
+```python
+from .base import Base
+from .market_data import (
+    RawMarketDataResponse,
+    ProcessedPricePoint,
+    MovingAverage,
+    PollingJobConfig,
+)
+
+__all__ = [
+    "Base",
+    "RawMarketDataResponse",
+    "ProcessedPricePoint",
+    "MovingAverage",
+    "PollingJobConfig",
+]
+```
+
+## Step 2: Database Connection & Session Management
+
+Create `app/core/database.py`:
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.pool import NullPool
+from typing import AsyncGenerator
+import logging
+
+from .config import settings
+
+logger = logging.getLogger(__name__)
+
+# Create async engine
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    poolclass=NullPool if settings.DEBUG else None,
+    pool_size=settings.DATABASE_POOL_SIZE,
+    max_overflow=settings.DATABASE_MAX_OVERFLOW,
+    echo=settings.DEBUG,
+)
+
+# Create session factory
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency to get database session"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+
+async def init_db() -> None:
+    """Initialize database tables"""
+    from app.models import Base
+    
+    async with engine.begin() as conn:
+        # Create all tables
+        await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables created successfully")
+
+
+async def close_db() -> None:
+    """Close database connections"""
+    await engine.dispose()
+    logger.info("Database connections closed")
+```
+
+## Step 3: Pydantic Schemas
+
+Create `app/schemas/market_data.py`:
+```python
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+
+
+class ProviderEnum(str, Enum):
+    ALPHA_VANTAGE = "alpha_vantage"
+    YAHOO_FINANCE = "yahoo_finance"
+    FINNHUB = "finnhub"
+
+
+class JobStatusEnum(str, Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    ACCEPTED = "accepted"
+
+
+class PriceResponse(BaseModel):
+    """Response schema for latest price endpoint"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    symbol: str = Field(..., description="Stock symbol")
+    price: Decimal = Field(..., description="Current price")
+    timestamp: datetime = Field(..., description="Price timestamp")
+    provider: str = Field(..., description="Data provider")
+    volume: Optional[Decimal] = Field(None, description="Trading volume")
+
+
+class PollingJobRequest(BaseModel):
+    """Request schema for polling job creation"""
+    symbols: List[str] = Field(..., min_items=1, max_items=50, description="List of symbols to poll")
+    interval: int = Field(..., ge=30, le=3600, description="Polling interval in seconds")
+    provider: ProviderEnum = Field(ProviderEnum.ALPHA_VANTAGE, description="Data provider")
+
+
+class PollingJobResponse(BaseModel):
+    """Response schema for polling job creation"""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatusEnum = Field(..., description="Job status")
+    config: Dict[str, Any] = Field(..., description="Job configuration")
+
+
+class MovingAverageResponse(BaseModel):
+    """Response schema for moving average data"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    symbol: str = Field(..., description="Stock symbol")
+    period: int = Field(..., description="Moving average period")
+    average_price: Decimal = Field(..., description="Calculated average price")
+    calculation_timestamp: datetime = Field(..., description="When the average was calculated")
+    sample_count: int = Field(..., description="Number of samples used")
+
+
+class ErrorResponse(BaseModel):
+    """Standard error response schema"""
+    error: str = Field(..., description="Error type")
+    message: str = Field(..., description="Error message")
+    details: Optional[Dict[str, Any]] = Field(None, description="Additional error details")
+```
+
+Create `app/schemas/__init__.py`:
+```python
+from .market_data import (
+    PriceResponse,
+    PollingJobRequest,
+    PollingJobResponse,
+    MovingAverageResponse,
+    ErrorResponse,
+    ProviderEnum,
+    JobStatusEnum,
+)
+
+__all__ = [
+    "PriceResponse",
+    "PollingJobRequest", 
+    "PollingJobResponse",
+    "MovingAverageResponse",
+    "ErrorResponse",
+    "ProviderEnum",
+    "JobStatusEnum",
+]
+```
+
+## Step 4: Core FastAPI Application
+
+Create `app/main.py`:
+```python
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+import logging
+import time
+import uuid
+
+from app.core.config import settings
+from app.core.database import init_db, close_db
+from app.api.v1.api import api_router
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application startup and shutdown"""
+    # Startup
+    logger.info("Starting Market Data Service...")
+    await init_db()
+    logger.info("Database initialized")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Market Data Service...")
+    await close_db()
+    logger.info("Market Data Service stopped")
+
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description=settings.DESCRIPTION,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan,
+)
+
+# Add middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.DEBUG else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# Add request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all requests with timing"""
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    # Add request ID to request state
+    request.state.request_id = request_id
+    
+    logger.info(f"Request {request_id}: {request.method} {request.url}")
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    logger.info(
+        f"Request {request_id} completed: "
+        f"Status {response.status_code} in {process_time:.3f}s"
+    )
+    
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    return response
+
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions"""
+    request_id = getattr(request.state, "request_id", "unknown")
+    logger.error(f"Request {request_id} failed with exception: {str(exc)}", exc_info=True)
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": "An unexpected error occurred",
+            "details": {"request_id": request_id}
+        }
+    )
+
+
+# Include API router
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": settings.PROJECT_NAME,
+        "version": settings.VERSION,
+        "timestamp": time.time()
+    }
+
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with service information"""
+    return {
+        "service": settings.PROJECT_NAME,
+        "version": settings.VERSION,
+        "description": settings.DESCRIPTION,
+        "docs_url": "/docs",
+        "health_url": "/health"
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.DEBUG,
+        log_level="info"
+    )
+```
+
+## Step 5: Create API Router Structure
+
+Create `app/api/__init__.py`:
+```python
+# API module initialization
+```
+
+Create `app/api/v1/__init__.py`:
+```python
+# API v1 module initialization
+```
+
+Create `app/api/v1/api.py`:
+```python
+from fastapi import APIRouter
+from app.api.v1.endpoints import prices, jobs, health
+
+api_router = APIRouter()
+
+# Include endpoint routers
+api_router.include_router(prices.router, prefix="/prices", tags=["prices"])
+api_router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
+api_router.include_router(health.router, prefix="/health", tags=["health"])
+```
+
+Create `app/api/v1/endpoints/__init__.py`:
+```python
+# Endpoints module initialization
+```
+
+## Step 6: Git Commit for Part 2
+
+```bash
+git add .
+git commit -m "Add database models and core FastAPI application
+
+- Created SQLAlchemy models for market data storage
+- Added Pydantic schemas for API request/response
+- Implemented async database connection management
+- Created FastAPI app with middleware and error handling
+- Set up API routing structure
+- Added health check and logging functionality
+- Ready for market data services implementation"
+```
+
