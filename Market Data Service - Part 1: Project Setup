@@ -1,0 +1,235 @@
+Market Data Service - Part 1: Project Setup
+Step 1: Create the project structure
+bashmkdir market-data-service
+cd market-data-service
+
+# Create main directories
+mkdir -p app/{api,core,models,services,schemas}
+mkdir -p tests/{unit,integration,e2e}
+mkdir -p docs
+mkdir -p docker
+mkdir -p .github/workflows
+mkdir -p requirements
+mkdir -p scripts
+
+# Create initial files
+touch app/__init__.py
+touch app/api/__init__.py
+touch app/core/__init__.py
+touch app/models/__init__.py
+touch app/services/__init__.py
+touch app/schemas/__init__.py
+touch tests/__init__.py
+Step 2: Create requirements files
+Create requirements/base.txt:
+txtfastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+alembic==1.13.1
+confluent-kafka==2.3.0
+redis==5.0.1
+httpx==0.25.2
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.2
+Create requirements/dev.txt:
+txt-r base.txt
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.7.1
+pre-commit==3.6.0
+httpx==0.25.2
+faker==20.1.0
+Create requirements/prod.txt:
+txt-r base.txt
+gunicorn==21.2.0
+prometheus-client==0.19.0
+Step 3: Create core configuration
+Create app/core/config.py:
+pythonfrom pydantic_settings import BaseSettings
+from typing import Optional, List
+import os
+
+
+class Settings(BaseSettings):
+    # API Settings
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "Market Data Service"
+    VERSION: str = "1.0.0"
+    DESCRIPTION: str = "Production-ready microservice for market data processing"
+    
+    # Server Settings
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    DEBUG: bool = False
+    
+    # Database Settings
+    DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/marketdata"
+    DATABASE_POOL_SIZE: int = 20
+    DATABASE_MAX_OVERFLOW: int = 0
+    
+    # Redis Settings
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CACHE_TTL: int = 300  # 5 minutes
+    
+    # Kafka Settings
+    KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9092"
+    KAFKA_PRICE_EVENTS_TOPIC: str = "price-events"
+    KAFKA_CONSUMER_GROUP: str = "market-data-consumers"
+    
+    # Market Data Provider Settings
+    MARKET_DATA_PROVIDER: str = "alpha_vantage"
+    ALPHA_VANTAGE_API_KEY: Optional[str] = None
+    FINNHUB_API_KEY: Optional[str] = None
+    
+    # Rate Limiting
+    RATE_LIMIT_PER_MINUTE: int = 60
+    
+    # Monitoring
+    ENABLE_METRICS: bool = True
+    METRICS_PORT: int = 9090
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+settings = Settings()
+Create app/core/__init__.py:
+pythonfrom .config import settings
+
+__all__ = ["settings"]
+Step 4: Create environment files
+Create .env.example:
+env# Database
+DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/marketdata
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+
+# Market Data APIs
+MARKET_DATA_PROVIDER=alpha_vantage
+ALPHA_VANTAGE_API_KEY=your_api_key_here
+FINNHUB_API_KEY=your_api_key_here
+
+# App Settings
+DEBUG=true
+HOST=0.0.0.0
+PORT=8000
+
+# Rate Limiting
+RATE_LIMIT_PER_MINUTE=60
+Create .env (copy from example and add real values)
+Step 5: Create basic gitignore and pre-commit config
+Create .gitignore:
+gitignore# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kafka logs
+kafka-logs/
+zookeeper/
+Create .pre-commit-config.yaml:
+yamlrepos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-json
+
+  - repo: https://github.com/psf/black
+    rev: 23.11.0
+    hooks:
+      - id: black
+        language_version: python3
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 6.1.0
+    hooks:
+      - id: flake8
+        args: [--max-line-length=88, --extend-ignore=E203]
+Step 6: First Git Commit
+bashgit init
+git add .
+git commit -m "Initial project setup with structure and configuration
+
+- Created project directory structure
+- Added requirements files for base, dev, and prod
+- Configured core settings with Pydantic
+- Added environment configuration
+- Set up pre-commit hooks and gitignore
+- Ready for FastAPI core implementation"
