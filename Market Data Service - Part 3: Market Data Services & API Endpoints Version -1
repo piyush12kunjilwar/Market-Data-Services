@@ -1,0 +1,234 @@
+# Market Data Service - Part 3: Market Data Services & API Endpoints
+
+## Step 1: Create Market Data Provider Interface
+
+Create `app/services/providers/__init__.py`:
+```python
+from .base import MarketDataProvider
+from .alpha_vantage import AlphaVantageProvider
+from .yahoo_finance import YahooFinanceProvider
+from .finnhub import FinnhubProvider
+from .factory import get_provider
+
+__all__ = [
+    "MarketDataProvider",
+    "AlphaVantageProvider", 
+    "YahooFinanceProvider",
+    "FinnhubProvider",
+    "get_provider",
+]
+```
+
+Create `app/services/providers/base.py`:
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional
+from datetime import datetime
+from decimal import Decimal
+
+
+class MarketDataResponse:
+    """Standardized market data response"""
+    
+    def __init__(
+        self,
+        symbol: str,
+        price: Decimal,
+        timestamp: datetime,
+        provider: str,
+        volume: Optional[Decimal] = None,
+        raw_data: Optional[Dict[str, Any]] = None,
+        response_time_ms: Optional[int] = None,
+    ):
+        self.symbol = symbol
+        self.price = price
+        self.timestamp = timestamp
+        self.provider = provider
+        self.volume = volume
+        self.raw_data = raw_data or {}
+        self.response_time_ms = response_time_ms
+
+
+class MarketDataProvider(ABC):
+    """Abstract base class for market data providers"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.provider_name = self.__class__.__name__.lower().replace("provider", "")
+    
+    @abstractmethod
+    async def fetch_latest_price(self, symbol: str) -> MarketDataResponse:
+        """Fetch the latest price for a symbol"""
+        pass
+    
+    @abstractmethod 
+    async def fetch_multiple_prices(self, symbols: list[str]) -> list[MarketDataResponse]:
+        """Fetch latest prices for multiple symbols"""
+        pass
+    
+    @abstractmethod
+    def get_rate_limit(self) -> tuple[int, int]:
+        """Return (calls_per_period, period_seconds)"""
+        pass
+    
+    @abstractmethod
+    async def validate_symbol(self, symbol: str) -> bool:
+        """Validate if symbol exists"""
+        pass
+```
+
+Create `app/services/providers/alpha_vantage.py`:
+```python
+import httpx
+import asyncio
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
+from decimal import Decimal
+import logging
+
+from .base import MarketDataProvider, MarketDataResponse
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class AlphaVantageProvider(MarketDataProvider):
+    """Alpha Vantage market data provider"""
+    
+    BASE_URL = "https://www.alphavantage.co"
+    
+    def __init__(self, api_key: Optional[str] = None):
+        super().__init__(api_key or settings.ALPHA_VANTAGE_API_KEY)
+        if not self.api_key:
+            raise ValueError("Alpha Vantage API key is required")
+    
+    async def fetch_latest_price(self, symbol: str) -> MarketDataResponse:
+        """Fetch latest price for a single symbol"""
+        start_time = datetime.now()
+        
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol,
+            "apikey": self.api_key,
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.get(f"{self.BASE_URL}/query", params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                response_time = int((datetime.now() - start_time).total_seconds() * 1000)
+                
+                # Check for API error
+                if "Error Message" in data:
+                    raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
+                
+                if "Note" in data:
+                    raise ValueError(f"Alpha Vantage rate limit: {data['Note']}")
+                
+                # Parse Global Quote response
+                quote = data.get("Global Quote", {})
+                if not quote:
+                    raise ValueError(f"No data found for symbol {symbol}")
+                
+                price = Decimal(quote.get("05. price", "0"))
+                volume = Decimal(quote.get("06. volume", "0"))
+                
+                # Parse timestamp (Alpha Vantage uses latest trading day)
+                latest_day = quote.get("07. latest trading day", "")
+                timestamp = datetime.fromisoformat(latest_day).replace(tzinfo=timezone.utc)
+                
+                return MarketDataResponse(
+                    symbol=symbol,
+                    price=price,
+                    timestamp=timestamp,
+                    provider="alpha_vantage",
+                    volume=volume,
+                    raw_data=data,
+                    response_time_ms=response_time,
+                )
+                
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error fetching {symbol} from Alpha Vantage: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Error fetching {symbol} from Alpha Vantage: {e}")
+                raise
+    
+    async def fetch_multiple_prices(self, symbols: List[str]) -> List[MarketDataResponse]:
+        """Fetch prices for multiple symbols with rate limiting"""
+        results = []
+        semaphore = asyncio.Semaphore(5)  # Limit concurrent requests
+        
+        async def fetch_with_semaphore(symbol: str):
+            async with semaphore:
+                try:
+                    result = await self.fetch_latest_price(symbol)
+                    return result
+                except Exception as e:
+                    logger.error(f"Failed to fetch {symbol}: {e}")
+                    return None
+        
+        tasks = [fetch_with_semaphore(symbol) for symbol in symbols]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for response in responses:
+            if isinstance(response, MarketDataResponse):
+                results.append(response)
+        
+        return results
+    
+    def get_rate_limit(self) -> tuple[int, int]:
+        """Alpha Vantage free tier: 5 calls per minute"""
+        return (5, 60)
+    
+    async def validate_symbol(self, symbol: str) -> bool:
+        """Validate symbol by attempting to fetch it"""
+        try:
+            await self.fetch_latest_price(symbol)
+            return True
+        except Exception:
+            return False
+```
+
+Create `app/services/providers/yahoo_finance.py`:
+```python
+import yfinance as yf
+from typing import List, Optional
+from datetime import datetime, timezone
+from decimal import Decimal
+import logging
+
+from .base import MarketDataProvider, MarketDataResponse
+
+logger = logging.getLogger(__name__)
+
+
+class YahooFinanceProvider(MarketDataProvider):
+    """Yahoo Finance provider using yfinance library"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        super().__init__(api_key)  # Yahoo Finance doesn't require API key
+    
+    async def fetch_latest_price(self, symbol: str) -> MarketDataResponse:
+        """Fetch latest price for a single symbol"""
+        start_time = datetime.now()
+        
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1d", interval="1m")
+            
+            if hist.empty:
+                raise ValueError(f"No data found for symbol {symbol}")
+            
+            # Get the latest data point
+            latest = hist.iloc[-1]
+            price = Decimal(str(latest['Close']))
+            volume = Decimal(str(latest['Volume']))
+            timestamp = latest.name.to_pydatetime().replace(tzinfo=timezone.utc)
+            
+            response_time = int((datetime.now() - start_time).total_seconds() * 1000)
+            
+            return MarketDataResponse(
+                symbol
