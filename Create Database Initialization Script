@@ -1,0 +1,15 @@
+-- Create extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_raw_market_data_symbol_timestamp ON raw_market_data(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_market_data_timestamp ON raw_market_data(timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_processed_prices_symbol_timestamp ON processed_prices(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_processed_prices_timestamp ON processed_prices(timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_moving_averages_symbol_timestamp ON moving_averages(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_moving_averages_symbol_period ON moving_averages(symbol, period);
+
+CREATE INDEX IF NOT EXISTS idx_polling_jobs_status ON polling_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_polling_jobs_created_at ON polling_jobs(created_at DESC);
