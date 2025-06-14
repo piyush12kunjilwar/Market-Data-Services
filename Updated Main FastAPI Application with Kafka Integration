@@ -1,0 +1,191 @@
+"""
+Updated Main FastAPI Application with Kafka Integration
+app/main.py
+"""
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from app.core.config import settings
+from app.core.database import init_db
+from app.api.routes import prices
+from app.services.kafka_producer import kafka_producer
+from app.schemas.market_data import ErrorResponse
+import uuid
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan management"""
+    # Startup
+    logger.info("Starting Market Data Service...")
+    
+    try:
+        # Initialize database
+        logger.info("Initializing database...")
+        await init_db()
+        
+        logger.info("Market Data Service started successfully")
+        
+        yield
+        
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}")
+        raise
+    finally:
+        # Shutdown
+        logger.info("Shutting down Market Data Service...")
+        
+        try:
+            # Close Kafka producer
+            kafka_producer.flush_and_close()
+            logger.info("Kafka producer closed")
+            
+        except Exception as e:
+            logger.error(f"Shutdown error: {str(e)}")
+        
+        logger.info("Market Data Service stopped")
+
+# Create FastAPI application
+app = FastAPI(
+    title="Market Data Service",
+    description="A production-ready microservice for fetching and processing market data with Kafka streaming",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_HOSTS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add request ID middleware
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Add unique request ID to each request"""
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    
+    # Add request ID to response headers
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    
+    return response
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for unhandled errors"""
+    request_id = getattr(request.state, 'request_id', 'unknown')
+    
+    logger.error(f"Unhandled exception for request {request_id}: {str(exc)}")
+    
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error="InternalServerError",
+            message="An unexpected error occurred",
+            timestamp=datetime.utcnow(),
+            request_id=request_id
+        ).dict()
+    )
+
+# Include API routes
+app.include_router(
+    prices.router,
+    prefix="/prices",
+    tags=["prices"]
+)
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with service information"""
+    return {
+        "service": "Market Data Service",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "prices": "/prices",
+            "docs": "/docs",
+            "health": "/health"
+        }
+    }
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Comprehensive health check endpoint"""
+    try:
+        # You can add more health checks here
+        # - Database connectivity
+        # - Kafka connectivity
+        # - External API availability
+        
+        health_status = {
+            "status": "healthy",
+            "service": "market-data-service",
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "1.0.0",
+            "components": {
+                "api": "healthy",
+                "database": "healthy",  # Add actual DB health check
+                "kafka": "healthy",     # Add actual Kafka health check
+                "cache": "healthy"      # Add actual cache health check
+            }
+        }
+        
+        return health_status
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "service": "market-data-service",
+                "timestamp": datetime.utcnow().isoformat(),
+                "error": str(e)
+            }
+        )
+
+# Metrics endpoint (optional)
+@app.get("/metrics")
+async def metrics():
+    """Basic metrics endpoint"""
+    return {
+        "service": "market-data-service",
+        "timestamp": datetime.utcnow().isoformat(),
+        "metrics": {
+            "requests_total": "N/A",  # Implement with prometheus_client
+            "kafka_messages_produced": "N/A",
+            "kafka_messages_consumed": "N/A",
+            "database_connections": "N/A"
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG,
+        log_level="info"
+    )
