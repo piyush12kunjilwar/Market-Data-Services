@@ -1,0 +1,133 @@
+# pytest.ini
+[tool:pytest]
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = 
+    -v
+    --tb=short
+    --strict-markers
+    --disable-warnings
+    --cov=app
+    --cov-report=html
+    --cov-report=term-missing
+    --cov-fail-under=80
+asyncio_mode = auto
+markers =
+    unit: Unit tests
+    integration: Integration tests
+    e2e: End-to-end tests
+    slow: Slow running tests
+
+
+# requirements/test.txt
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.2
+pytest-mock==3.12.0
+faker==20.1.0
+
+
+# Makefile
+.PHONY: test test-unit test-integration test-e2e test-coverage clean lint format
+
+# Testing commands
+test:
+	pytest
+
+test-unit:
+	pytest -m unit
+
+test-integration:
+	pytest -m integration
+
+test-e2e:
+	pytest -m e2e
+
+test-coverage:
+	pytest --cov=app --cov-report=html --cov-report=term-missing
+
+test-watch:
+	pytest --watch
+
+# Code quality commands
+lint:
+	flake8 app/ tests/
+	mypy app/
+
+format:
+	black app/ tests/
+	isort app/ tests/
+
+format-check:
+	black --check app/ tests/
+	isort --check-only app/ tests/
+
+# Docker commands
+docker-build:
+	docker-compose build
+
+docker-test:
+	docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
+
+docker-up:
+	docker-compose up -d
+
+docker-down:
+	docker-compose down
+
+docker-logs:
+	docker-compose logs -f
+
+# Database commands
+db-migrate:
+	python scripts/migrate.py
+
+db-seed:
+	python scripts/seed_data.py
+
+# Development commands
+dev:
+	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+install:
+	pip install -r requirements/base.txt
+	pip install -r requirements/dev.txt
+
+install-test:
+	pip install -r requirements/test.txt
+
+clean:
+	find . -type f -name "*.pyc" -delete
+	find . -type d -name "__pycache__" -delete
+	find . -type f -name "*.coverage" -delete
+	rm -rf htmlcov/
+	rm -rf .pytest_cache/
+	rm -rf .coverage
+
+# Pre-commit setup
+pre-commit-install:
+	pre-commit install
+
+pre-commit-run:
+	pre-commit run --all-files
+
+# Help command
+help:
+	@echo "Available commands:"
+	@echo "  test              - Run all tests"
+	@echo "  test-unit         - Run unit tests only"
+	@echo "  test-integration  - Run integration tests only"
+	@echo "  test-e2e          - Run end-to-end tests only"
+	@echo "  test-coverage     - Run tests with coverage report"
+	@echo "  lint              - Run linting checks"
+	@echo "  format            - Format code"
+	@echo "  docker-build      - Build Docker containers"
+	@echo "  docker-test       - Run tests in Docker"
+	@echo "  docker-up         - Start all services"
+	@echo "  docker-down       - Stop all services"
+	@echo "  dev               - Start development server"
+	@echo "  install           - Install dependencies"
+	@echo "  clean             - Clean temporary files"
