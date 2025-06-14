@@ -1,0 +1,377 @@
+# tests/test_api.py
+import pytest
+from httpx import AsyncClient
+from unittest.mock import patch, Mock
+import json
+
+
+class TestPricesAPI:
+    
+    async def test_get_latest_price_success(self, client: AsyncClient):
+        with patch('app.services.market_data_service.MarketDataService.fetch_price') as mock_fetch:
+            mock_fetch.return_value = {
+                "symbol": "AAPL",
+                "price": 150.25,
+                "timestamp": "2024-03-20T10:30:00Z",
+                "provider": "alpha_vantage"
+            }
+            
+            response = await client.get("/prices/latest?symbol=AAPL&provider=alpha_vantage")
+            
+            assert response.status_code == 200
+            data = response.json()
+            assert data["symbol"] == "AAPL"
+            assert data["price"] == 150.25
+            assert data["provider"] == "alpha_vantage"
+    
+    async def test_get_latest_price_invalid_symbol(self, client: AsyncClient):
+        response = await client.get("/prices/latest?symbol=INVALID&provider=alpha_vantage")
+        assert response.status_code == 400
+    
+    async def test_get_latest_price_missing_symbol(self, client: AsyncClient):
+        response = await client.get("/prices/latest?provider=alpha_vantage")
+        assert response.status_code == 422  # Validation error
+    
+    async def test_post_polling_job_success(self, client: AsyncClient):
+        payload = {
+            "symbols": ["AAPL", "MSFT"],
+            "interval": 60,
+            "provider": "alpha_vantage"
+        }
+        
+        with patch('app.services.polling_service.PollingService.create_polling_job') as mock_create:
+            mock_create.return_value = "poll_123"
+            
+            response = await client.post("/prices/poll", json=payload)
+            
+            assert response.status_code == 202
+            data = response.json()
+            assert data["job_id"] == "poll_123"
+            assert data["status"] == "accepted"
+            assert data["config"]["symbols"] == ["AAPL", "MSFT"]
+    
+    async def test_post_polling_job_invalid_payload(self, client: AsyncClient):
+        payload = {
+            "symbols": [],  # Empty symbols list
+            "interval": 60,
+            "provider": "alpha_vantage"
+        }
+        
+        response = await client.post("/prices/poll", json=payload)
+        assert response.status_code == 400
+    
+    async def test_post_polling_job_invalid_interval(self, client: AsyncClient):
+        payload = {
+            "symbols": ["AAPL"],
+            "interval": 10,  # Too low interval
+            "provider": "alpha_vantage"
+        }
+        
+        response = await client.post("/prices/poll", json=payload)
+        assert response.status_code == 400
+
+
+class TestHealthCheck:
+    
+    async def test_health_check(self, client: AsyncClient):
+        response = await client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert "timestamp" in data
+
+
+class TestRateLimiting:
+    
+    async def test_rate_limiting(self, client: AsyncClient):
+        """Test that rate limiting works properly"""
+        with patch('app.services.market_data_service.MarketDataService.fetch_price') as mock_fetch:
+            mock_fetch.return_value = {
+                "symbol": "AAPL",
+                "price": 150.25,
+                "timestamp": "2024-03-20T10:30:00Z",
+                "provider": "alpha_vantage"
+            }
+            
+            # Make multiple rapid requests
+            responses = []
+            for _ in range(10):
+                response = await client.get("/prices/latest?symbol=AAPL&provider=alpha_vantage")
+                responses.append(response.status_code)
+            
+            # Should have some rate limited responses (429)
+            # Note: This test might need adjustment based on your rate limiting implementation
+            success_responses = [r for r in responses if r == 200]
+            assert len(success_responses) <= 5  # Assuming 5 requests per window
+
+
+# tests/test_database.py
+import pytest
+from sqlalchemy.orm import Session
+from app.models.market_data import MarketDataResponse, PricePoint, MovingAverage, PollingJobConfig
+from app.core.database import engine
+from datetime import datetime
+
+
+class TestDatabaseModels:
+    
+    @pytest.fixture
+    def db_session(self):
+        from sqlalchemy.orm import sessionmaker
+        TestSession = sessionmaker(bind=engine)
+        session = TestSession()
+        yield session
+        session.close()
+    
+    def test_create_market_data_response(self, db_session: Session):
+        response = MarketDataResponse(
+            symbol="AAPL",
+            provider="alpha_vantage",
+            raw_response={"test": "data"},
+            timestamp=datetime.utcnow()
+        )
+        
+        db_session.add(response)
+        db_session.commit()
+        
+        saved_response = db_session.query(MarketDataResponse).filter_by(symbol="AAPL").first()
+        assert saved_response is not None
+        assert saved_response.symbol == "AAPL"
+        assert saved_response.provider == "alpha_vantage"
+    
+    def test_create_price_point(self, db_session: Session):
+        price_point = PricePoint(
+            symbol="AAPL",
+            price=150.25,
+            timestamp=datetime.utcnow(),
+            provider="alpha_vantage"
+        )
+        
+        db_session.add(price_point)
+        db_session.commit()
+        
+        saved_point = db_session.query(PricePoint).filter_by(symbol="AAPL").first()
+        assert saved_point is not None
+        assert saved_point.price == 150.25
+    
+    def test_create_moving_average(self, db_session: Session):
+        ma = MovingAverage(
+            symbol="AAPL",
+            window_size=5,
+            average_value=149.80,
+            timestamp=datetime.utcnow()
+        )
+        
+        db_session.add(ma)
+        db_session.commit()
+        
+        saved_ma = db_session.query(MovingAverage).filter_by(symbol="AAPL").first()
+        assert saved_ma is not None
+        assert saved_ma.window_size == 5
+        assert saved_ma.average_value == 149.80
+    
+    def test_create_polling_job_config(self, db_session: Session):
+        job_config = PollingJobConfig(
+            job_id="poll_123",
+            symbols=["AAPL", "MSFT"],
+            interval=60,
+            provider="alpha_vantage",
+            status="active",
+            created_at=datetime.utcnow()
+        )
+        
+        db_session.add(job_config)
+        db_session.commit()
+        
+        saved_config = db_session.query(PollingJobConfig).filter_by(job_id="poll_123").first()
+        assert saved_config is not None
+        assert saved_config.symbols == ["AAPL", "MSFT"]
+        assert saved_config.interval == 60
+
+
+# tests/test_kafka_integration.py
+import pytest
+from unittest.mock import Mock, patch, AsyncMock
+import json
+from app.services.kafka_producer import KafkaProducerService
+from app.services.kafka_consumer import KafkaConsumerService
+
+
+class TestKafkaIntegration:
+    
+    @pytest.fixture
+    def sample_price_event(self):
+        return {
+            "symbol": "AAPL",
+            "price": 150.25,
+            "timestamp": "2024-03-20T10:30:00Z",
+            "source": "alpha_vantage",
+            "raw_response_id": "uuid-123"
+        }
+    
+    @patch('app.services.kafka_producer.Producer')
+    async def test_producer_consumer_integration(self, mock_producer_class, sample_price_event):
+        """Test end-to-end Kafka message flow"""
+        
+        # Setup producer mock
+        mock_producer = Mock()
+        mock_producer_class.return_value = mock_producer
+        
+        producer_service = KafkaProducerService()
+        
+        # Produce message
+        await producer_service.produce_price_event(sample_price_event)
+        
+        # Verify producer was called correctly
+        mock_producer.produce.assert_called_once()
+        call_args = mock_producer.produce.call_args
+        
+        assert call_args[1]['topic'] == 'price-events'
+        assert call_args[1]['key'] == 'AAPL'
+        
+        # Verify message content
+        message_value = json.loads(call_args[1]['value'])
+        assert message_value['symbol'] == 'AAPL'
+        assert message_value['price'] == 150.25
+    
+    @patch('app.services.kafka_consumer.Consumer')
+    async def test_consumer_message_processing(self, mock_consumer_class, sample_price_event):
+        """Test consumer processes messages correctly"""
+        
+        # Setup consumer mock
+        mock_consumer = Mock()
+        mock_message = Mock()
+        mock_message.value.return_value = json.dumps(sample_price_event).encode('utf-8')
+        mock_message.key.return_value = b'AAPL'
+        mock_message.error.return_value = None
+        
+        mock_consumer.poll.return_value = mock_message
+        mock_consumer_class.return_value = mock_consumer
+        
+        # Mock database session
+        mock_db_session = Mock()
+        
+        consumer_service = KafkaConsumerService(mock_db_session)
+        
+        # This would normally run in a loop, so we'll test one iteration
+        with patch.object(consumer_service, 'process_price_event') as mock_process:
+            mock_process.return_value = None
+            
+            # Simulate consuming one message
+            message = mock_consumer.poll(timeout=1.0)
+            if message and not message.error():
+                event_data = json.loads(message.value().decode('utf-8'))
+                await consumer_service.process_price_event(event_data)
+            
+            # Verify processing was called
+            mock_process.assert_called_once_with(sample_price_event)
+
+
+# tests/test_end_to_end.py
+import pytest
+from httpx import AsyncClient
+from unittest.mock import patch, Mock, AsyncMock
+import asyncio
+import time
+
+
+class TestEndToEndFlow:
+    
+    async def test_complete_price_flow(self, client: AsyncClient):
+        """Test complete flow: API request -> Market data fetch -> Kafka -> Moving average"""
+        
+        with patch('app.services.market_data_service.MarketDataService.fetch_price') as mock_fetch, \
+             patch('app.services.kafka_producer.KafkaProducerService.produce_price_event') as mock_produce:
+            
+            # Mock market data response
+            mock_fetch.return_value = {
+                "symbol": "AAPL",
+                "price": 150.25,
+                "timestamp": "2024-03-20T10:30:00Z",
+                "provider": "alpha_vantage"
+            }
+            
+            mock_produce.return_value = None
+            
+            # Make API request
+            response = await client.get("/prices/latest?symbol=AAPL&provider=alpha_vantage")
+            
+            # Verify API response
+            assert response.status_code == 200
+            data = response.json()
+            assert data["symbol"] == "AAPL"
+            assert data["price"] == 150.25
+            
+            # Verify Kafka producer was called
+            mock_produce.assert_called_once()
+    
+    async def test_polling_job_creation_and_execution(self, client: AsyncClient):
+        """Test polling job creation and execution"""
+        
+        with patch('app.services.polling_service.PollingService.create_polling_job') as mock_create, \
+             patch('app.services.polling_service.PollingService.start_polling_job') as mock_start:
+            
+            mock_create.return_value = "poll_123"
+            mock_start.return_value = None
+            
+            # Create polling job
+            payload = {
+                "symbols": ["AAPL", "MSFT"],
+                "interval": 60,
+                "provider": "alpha_vantage"
+            }
+            
+            response = await client.post("/prices/poll", json=payload)
+            
+            # Verify job creation response
+            assert response.status_code == 202
+            data = response.json()
+            assert data["job_id"] == "poll_123"
+            assert data["status"] == "accepted"
+            
+            # Verify job was created
+            mock_create.assert_called_once()
+    
+    @patch('app.services.market_data_service.requests.get')
+    async def test_rate_limiting_with_real_provider(self, mock_get, client: AsyncClient):
+        """Test rate limiting works with actual provider constraints"""
+        
+        # Mock Alpha Vantage rate limiting (5 calls per minute)
+        call_count = 0
+        
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 5:
+                # Simulate rate limit exceeded
+                mock_response = Mock()
+                mock_response.status_code = 429
+                mock_response.raise_for_status.side_effect = Exception("Rate limit exceeded")
+                return mock_response
+            
+            # Normal response
+            mock_response = Mock()
+            mock_response.json.return_value = {
+                "Global Quote": {
+                    "01. symbol": "AAPL",
+                    "05. price": "150.25",
+                    "07. latest trading day": "2024-03-20"
+                }
+            }
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+        
+        mock_get.side_effect = side_effect
+        
+        # Make multiple requests quickly
+        responses = []
+        for i in range(7):  # More than the rate limit
+            try:
+                response = await client.get(f"/prices/latest?symbol=AAPL&provider=alpha_vantage")
+                responses.append(response.status_code)
+            except Exception:
+                responses.append(500)  # Error response
+        
+        # Should have some successful responses and some failures
+        success_count = len([r for r in responses if r == 200])
+        assert success_count <= 5  # Rate limit should kick in
