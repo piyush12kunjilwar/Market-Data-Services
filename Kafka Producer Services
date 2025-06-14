@@ -150,4 +150,50 @@ class KafkaProducerService:
                 'symbols': symbols,
                 'interval': interval,
                 'status': status,
-                '
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Serialize message
+            message_json = json.dumps(message_data)
+            
+            # Produce message
+            self.producer.produce(
+                topic='polling-events',
+                key=job_id,
+                value=message_json,
+                callback=self.delivery_report
+            )
+            
+            # Trigger delivery report callbacks
+            self.producer.poll(0)
+            
+            logger.info(f"Published polling event for job {job_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error publishing polling event for job {job_id}: {e}", exc_info=True)
+            return False
+    
+    def flush(self, timeout: float = 10.0):
+        """Flush all buffered messages."""
+        if self.producer:
+            self.producer.flush(timeout)
+    
+    def close(self):
+        """Close the producer and flush remaining messages."""
+        if self.producer:
+            logger.info("Closing Kafka producer...")
+            self.producer.flush(10)  # Wait up to 10 seconds for messages to be delivered
+            self.producer = None
+
+
+# Global producer instance
+_producer_instance = None
+
+
+def get_kafka_producer() -> KafkaProducerService:
+    """Get or create Kafka producer instance."""
+    global _producer_instance
+    if _producer_instance is None:
+        _producer_instance = KafkaProducerService()
+    return _producer_instance
