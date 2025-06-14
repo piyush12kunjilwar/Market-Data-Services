@@ -1,238 +1,156 @@
 """
-Kafka Consumer Service for Processing Price Events and Calculating Moving Averages
+Updated Pydantic Schemas with Kafka Events
+app/schemas/market_data.py
 """
-import json
-import logging
-import asyncio
-from typing import List, Optional
-from datetime import datetime, timezone
-from confluent_kafka import Consumer, KafkaError, KafkaException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
-from app.core.config import settings
-from app.core.database import get_session
-from app.models.market_data import PriceData, MovingAverage
-from app.schemas.market_data import PriceEvent
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, validator
 
-logger = logging.getLogger(__name__)
+class PriceResponse(BaseModel):
+    """Response schema for price data"""
+    symbol: str = Field(..., description="Stock symbol")
+    price: float = Field(..., description="Current price")
+    timestamp: datetime = Field(..., description="Timestamp of the price")
+    provider: str = Field(..., description="Data provider name")
 
-class MovingAverageCalculator:
-    """Service for calculating moving averages"""
-    
-    @staticmethod
-    def calculate_moving_average(prices: List[float], window: int = 5) -> float:
-        """
-        Calculate simple moving average
-        
-        Args:
-            prices: List of price values
-            window: Window size for moving average
-            
-        Returns:
-            float: Calculated moving average
-        """
-        if len(prices) < window:
-            return sum(prices) / len(prices)
-        
-        return sum(prices[-window:]) / window
-
-class KafkaConsumerService:
-    def __init__(self):
-        self.consumer_config = {
-            'bootstrap.servers': settings.KAFKA_BOOTSTRAP_SERVERS,
-            'group.id': 'moving-average-processor',
-            'client.id': 'ma-consumer',
-            'auto.offset.reset': 'earliest',
-            'enable.auto.commit': False,  # Manual commit for reliability
-            'max.poll.interval.ms': 300000,  # 5 minutes
-            'session.timeout.ms': 30000,
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
         }
-        self.consumer = Consumer(self.consumer_config)
-        self.topic = settings.KAFKA_TOPIC_PRICE_EVENTS
-        self.running = False
-        self.ma_calculator = MovingAverageCalculator()
 
-    async def get_recent_prices(self, session: AsyncSession, symbol: str, limit: int = 5) -> List[float]:
-        """
-        Get recent prices for a symbol from database
-        
-        Args:
-            session: Database session
-            symbol: Stock symbol
-            limit: Number of recent prices to fetch
-            
-        Returns:
-            List of recent prices
-        """
-        try:
-            stmt = (
-                select(PriceData.price)
-                .where(PriceData.symbol == symbol)
-                .order_by(desc(PriceData.timestamp))
-                .limit(limit)
-            )
-            result = await session.execute(stmt)
-            prices = [row[0] for row in result.fetchall()]
-            return list(reversed(prices))  # Return in chronological order
-            
-        except Exception as e:
-            logger.error(f"Error fetching recent prices for {symbol}: {str(e)}")
-            return []
+class PriceEvent(BaseModel):
+    """Kafka message schema for price events"""
+    symbol: str = Field(..., description="Stock symbol")
+    price: float = Field(..., description="Price value")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    source: str = Field(..., description="Data source/provider")
+    raw_response_id: str = Field(..., description="Reference to raw response")
 
-    async def store_moving_average(
-        self, 
-        session: AsyncSession, 
-        symbol: str, 
-        moving_average: float,
-        timestamp: datetime,
-        window_size: int = 5
-    ) -> bool:
-        """
-        Store calculated moving average in database
-        
-        Args:
-            session: Database session
-            symbol: Stock symbol
-            moving_average: Calculated moving average value
-            timestamp: Timestamp for the moving average
-            window_size: Window size used for calculation
-        """
-        try:
-            ma_record = MovingAverage(
-                symbol=symbol,
-                moving_average=moving_average,
-                window_size=window_size,
-                timestamp=timestamp
-            )
-            
-            session.add(ma_record)
-            await session.commit()
-            
-            logger.info(f"Stored moving average for {symbol}: {moving_average}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing moving average for {symbol}: {str(e)}")
-            await session.rollback()
-            return False
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
-    async def process_price_event(self, price_event: PriceEvent) -> bool:
-        """
-        Process a price event and calculate moving average
-        
-        Args:
-            price_event: Price event from Kafka
-            
-        Returns:
-            bool: True if processed successfully
-        """
-        try:
-            async for session in get_session():
-                # Get recent prices including the new one
-                recent_prices = await self.get_recent_prices(
-                    session, 
-                    price_event.symbol, 
-                    limit=5
-                )
-                
-                # Add the new price
-                recent_prices.append(price_event.price)
-                
-                # Calculate moving average
-                moving_average = self.ma_calculator.calculate_moving_average(recent_prices)
-                
-                # Store the moving average
-                success = await self.store_moving_average(
-                    session,
-                    price_event.symbol,
-                    moving_average,
-                    price_event.timestamp
-                )
-                
-                if success:
-                    logger.info(
-                        f"Processed price event for {price_event.symbol}: "
-                        f"Price={price_event.price}, MA={moving_average:.2f}"
-                    )
-                    return True
-                
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error processing price event: {str(e)}")
-            return False
+class PollRequest(BaseModel):
+    """Request schema for polling job creation"""
+    symbols: List[str] = Field(..., description="List of symbols to poll")
+    interval: int = Field(..., ge=60, description="Polling interval in seconds (minimum 60)")
+    provider: Optional[str] = Field(None, description="Preferred data provider")
 
-    async def consume_messages(self):
-        """
-        Main consumer loop for processing price events
-        """
-        try:
-            self.consumer.subscribe([self.topic])
-            logger.info(f"Started consuming from topic: {self.topic}")
-            self.running = True
-            
-            while self.running:
-                try:
-                    # Poll for messages
-                    msg = self.consumer.poll(timeout=1.0)
-                    
-                    if msg is None:
-                        continue
-                        
-                    if msg.error():
-                        if msg.error().code() == KafkaError._PARTITION_EOF:
-                            logger.info(f"Reached end of partition: {msg.topic()}[{msg.partition()}]")
-                        else:
-                            logger.error(f"Consumer error: {msg.error()}")
-                        continue
-                    
-                    # Process the message
-                    try:
-                        # Parse message value
-                        message_data = json.loads(msg.value().decode('utf-8'))
-                        price_event = PriceEvent(**message_data)
-                        
-                        # Process the price event
-                        success = await self.process_price_event(price_event)
-                        
-                        if success:
-                            # Commit the message
-                            self.consumer.commit(msg)
-                            logger.debug(f"Committed message for {price_event.symbol}")
-                        else:
-                            logger.error(f"Failed to process message for {price_event.symbol}")
-                            
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to decode message: {str(e)}")
-                        self.consumer.commit(msg)  # Skip malformed messages
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing message: {str(e)}")
-                        # Don't commit on processing errors
-                        
-                except KafkaException as e:
-                    logger.error(f"Kafka exception: {str(e)}")
-                    await asyncio.sleep(5)  # Wait before retrying
-                    
-        except Exception as e:
-            logger.error(f"Consumer loop error: {str(e)}")
-            
-        finally:
-            self.consumer.close()
-            logger.info("Kafka consumer closed")
+    @validator('symbols')
+    def validate_symbols(cls, v):
+        if not v:
+            raise ValueError('At least one symbol is required')
+        if len(v) > 10:
+            raise ValueError('Maximum 10 symbols allowed per poll job')
+        return [symbol.upper().strip() for symbol in v]
 
-    def stop_consuming(self):
-        """Stop the consumer loop"""
-        self.running = False
-        logger.info("Consumer stop requested")
+class PollResponse(BaseModel):
+    """Response schema for poll job creation"""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(..., description="Job status")
+    config: Dict[str, Any] = Field(..., description="Job configuration")
 
-# Consumer instance
-kafka_consumer = KafkaConsumerService()
+class MovingAverageResponse(BaseModel):
+    """Response schema for moving average data"""
+    symbol: str = Field(..., description="Stock symbol")
+    moving_average: float = Field(..., description="Calculated moving average")
+    window_size: int = Field(..., description="Window size used for calculation")
+    timestamp: datetime = Field(..., description="Calculation timestamp")
 
-async def start_kafka_consumer():
-    """Start the Kafka consumer in background"""
-    await kafka_consumer.consume_messages()
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
-def stop_kafka_consumer():
-    """Stop the Kafka consumer"""
-    kafka_consumer.stop_consuming()
+class HealthCheckResponse(BaseModel):
+    """Health check response schema"""
+    status: str = Field(..., description="Service status")
+    service: str = Field(..., description="Service name")
+    timestamp: datetime = Field(..., description="Check timestamp")
+    kafka_status: Optional[str] = Field(None, description="Kafka connection status")
+    database_status: Optional[str] = Field(None, description="Database connection status")
+    cache_status: Optional[str] = Field(None, description="Cache connection status")
+
+class ErrorResponse(BaseModel):
+    """Error response schema"""
+    error: str = Field(..., description="Error type")
+    message: str = Field(..., description="Error message")
+    timestamp: datetime = Field(..., description="Error timestamp")
+    request_id: Optional[str] = Field(None, description="Request identifier")
+
+# Base schemas for database models
+class PriceDataBase(BaseModel):
+    """Base schema for price data"""
+    symbol: str
+    price: float
+    provider: str
+    timestamp: datetime
+
+class PriceDataCreate(PriceDataBase):
+    """Schema for creating price data"""
+    raw_response_id: Optional[str] = None
+
+class PriceDataInDB(PriceDataBase):
+    """Schema for price data from database"""
+    id: int
+    raw_response_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class MovingAverageBase(BaseModel):
+    """Base schema for moving average"""
+    symbol: str
+    moving_average: float
+    window_size: int
+    timestamp: datetime
+
+class MovingAverageCreate(MovingAverageBase):
+    """Schema for creating moving average"""
+    pass
+
+class MovingAverageInDB(MovingAverageBase):
+    """Schema for moving average from database"""
+    id: int
+
+    class Config:
+        from_attributes = True
+
+class RawMarketDataBase(BaseModel):
+    """Base schema for raw market data"""
+    symbol: str
+    provider: str
+    raw_response: Dict[str, Any]
+    timestamp: datetime
+
+class RawMarketDataCreate(RawMarketDataBase):
+    """Schema for creating raw market data"""
+    id: str
+
+class RawMarketDataInDB(RawMarketDataBase):
+    """Schema for raw market data from database"""
+    id: str
+
+    class Config:
+        from_attributes = True
+
+class PollJobBase(BaseModel):
+    """Base schema for poll job"""
+    job_id: str
+    symbols: List[str]
+    interval: int
+    provider: str
+    status: str
+
+class PollJobCreate(PollJobBase):
+    """Schema for creating poll job"""
+    pass
+
+class PollJobInDB(PollJobBase):
+    """Schema for poll job from database"""
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
