@@ -1,0 +1,101 @@
+# Environment Variables Configuration
+# Copy this file to .env and update the values
+
+# ======================
+# DATABASE CONFIGURATION
+# ======================
+DATABASE_NAME=market_data
+DATABASE_USER=postgres
+DATABASE_PASSWORD=postgres
+DATABASE_HOST=localhost
+DATABASE_PORT=5432
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/market_data
+
+# ======================
+# REDIS CONFIGURATION
+# ======================
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_URL=redis://localhost:6379/0
+
+# ======================
+# KAFKA CONFIGURATION
+# ======================
+KAFKA_BOOTSTRAP_SERVERS=localhost:29092
+KAFKA_TOPIC_PRICE_EVENTS=price-events
+
+# ======================
+# API KEYS
+# ======================
+# Alpha Vantage API Key (get from: https://www.alphavantage.co/support/#api-key)
+ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here
+
+# Finnhub API Key (get from: https://finnhub.io/register)
+FINNHUB_API_KEY=your_finnhub_api_key_here
+
+# ======================
+# APPLICATION SETTINGS
+# ======================
+DEBUG=true
+LOG_LEVEL=info
+ALLOWED_HOSTS=["*"]
+
+# Default market data provider (alpha_vantage, yahoo_finance, finnhub)
+DEFAULT_MARKET_PROVIDER=alpha_vantage
+
+# ======================
+# SERVICE PORTS
+# ======================
+API_PORT=8000
+ADMINER_PORT=8080
+KAFKA_UI_PORT=8081
+
+# ======================
+# RATE LIMITING
+# ======================
+# Requests per minute for API endpoints
+API_RATE_LIMIT=100
+
+# ======================
+# CACHING
+# ======================
+# Cache TTL in seconds
+PRICE_CACHE_TTL=300
+MOVING_AVERAGE_CACHE_TTL=600
+
+# ======================
+# MONITORING (Optional)
+# ======================
+# Enable metrics collection
+ENABLE_METRICS=false
+
+# Prometheus endpoint
+PROMETHEUS_PORT=9090
+
+# ======================
+# SECURITY
+# ======================
+# Secret key for JWT tokens (if implementing authentication)
+SECRET_KEY=your-secret-key-here
+
+# CORS origins (comma-separated)
+CORS_ORIGINS=http://localhost:3000,http://localhost:8000
+
+# ======================
+# EXTERNAL SERVICES
+# ======================
+# Request timeout for external API calls (seconds)
+EXTERNAL_API_TIMEOUT=30
+
+# Max retries for external API calls
+EXTERNAL_API_MAX_RETRIES=3
+
+# ======================
+# DEVELOPMENT SETTINGS
+# ======================
+# Auto-reload for development
+AUTO_RELOAD=true
+
+# Database echo SQL queries
+DATABASE_ECHO=false
