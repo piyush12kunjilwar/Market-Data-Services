@@ -1,0 +1,338 @@
+"""
+Polling Service for scheduled market data fetching.
+"""
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+import uuid
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+
+from app.core.database import get_async_session
+from app.models.market_data import PollingJob
+from app.services.market_data import get_market_data_service
+from app.services.kafka_producer import get_kafka_producer
+
+logger = logging.getLogger(__name__)
+
+
+class PollingService:
+    """Service for managing scheduled market data polling."""
+    
+    def __init__(self):
+        self.market_data_service = get_market_data_service()
+        self.kafka_producer = get_kafka_producer()
+        self.active_jobs: Dict[str, asyncio.Task] = {}
+    
+    async def create_polling_job(
+        self,
+        symbols: List[str],
+        interval: int,
+        provider: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Create a new polling job."""
+        try:
+            job_id = str(uuid.uuid4())
+            
+            # Validate inputs
+            if not symbols:
+                raise ValueError("Symbols list cannot be empty")
+            if interval < 30:
+                raise ValueError("Minimum interval is 30 seconds")
+            
+            # Store job in database
+            async with get_async_session() as session:
+                polling_job = PollingJob(
+                    id=job_id,
+                    symbols=symbols,
+                    interval=interval,
+                    provider=provider,
+                    status="active",
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(polling_job)
+                await session.commit()
+            
+            # Start polling task
+            task = asyncio.create_task(
+                self._polling_task(job_id, symbols, interval, provider)
+            )
+            self.active_jobs[job_id] = task
+            
+            # Publish polling event
+            await self.kafka_producer.publish_polling_event(
+                job_id=job_id,
+                symbols=symbols,
+                interval=interval,
+                status="started"
+            )
+            
+            logger.info(f"Created polling job {job_id} for symbols {symbols}")
+            
+            return {
+                "job_id": job_id,
+                "status": "accepted",
+                "config": {
+                    "symbols": symbols,
+                    "interval": interval,
+                    "provider": provider
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error creating polling job: {e}")
+            raise
+    
+    async def _polling_task(
+        self,
+        job_id: str,
+        symbols: List[str],
+        interval: int,
+        provider: Optional[str] = None
+    ):
+        """Main polling task loop."""
+        logger.info(f"Starting polling task {job_id}")
+        
+        try:
+            while job_id in self.active_jobs:
+                # Check if job is still active in database
+                if not await self._is_job_active(job_id):
+                    logger.info(f"Job {job_id} is no longer active, stopping")
+                    break
+                
+                # Fetch prices for all symbols
+                for symbol in symbols:
+                    try:
+                        await self.market_data_service.get_latest_price(
+                            symbol=symbol,
+                            provider=provider,
+                            use_cache=False  # Don't use cache for polling
+                        )
+                        logger.debug(f"Polled price for {symbol} in job {job_id}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error polling {symbol} in job {job_id}: {e}")
+                        continue
+                
+                # Update last run time
+                await self._update_job_last_run(job_id)
+                
+                # Wait for next interval
+                await asyncio.sleep(interval)
+                
+        except asyncio.CancelledError:
+            logger.info(f"Polling task {job_id} was cancelled")
+        except Exception as e:
+            logger.error(f"Error in polling task {job_id}: {e}")
+            await self._mark_job_failed(job_id, str(e))
+        finally:
+            # Clean up
+            if job_id in self.active_jobs:
+                del self.active_jobs[job_id]
+            logger.info(f"Polling task {job_id} stopped")
+    
+    async def _is_job_active(self, job_id: str) -> bool:
+        """Check if a job is still active in the database."""
+        try:
+            async with get_async_session() as session:
+                stmt = select(PollingJob.status).where(PollingJob.id == job_id)
+                result = await session.execute(stmt)
+                status = result.scalar_one_or_none()
+                return status == "active"
+        except Exception:
+            return False
+    
+    async def _update_job_last_run(self, job_id: str):
+        """Update the last run time for a job."""
+        try:
+            async with get_async_session() as session:
+                stmt = (
+                    update(PollingJob)
+                    .where(PollingJob.id == job_id)
+                    .values(
+                        last_run=datetime.now(timezone.utc),
+                        updated_at=datetime.now(timezone.utc)
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Error updating job last run time: {e}")
+    
+    async def _mark_job_failed(self, job_id: str, error_message: str):
+        """Mark a job as failed."""
+        try:
+            async with get_async_session() as session:
+                stmt = (
+                    update(PollingJob)
+                    .where(PollingJob.id == job_id)
+                    .values(
+                        status="failed",
+                        error_message=error_message,
+                        updated_at=datetime.now(timezone.utc)
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Error marking job as failed: {e}")
+    
+    async def stop_polling_job(self, job_id: str) -> bool:
+        """Stop a polling job."""
+        try:
+            # Cancel the task
+            if job_id in self.active_jobs:
+                task = self.active_jobs[job_id]
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                del self.active_jobs[job_id]
+            
+            # Update database
+            async with get_async_session() as session:
+                stmt = (
+                    update(PollingJob)
+                    .where(PollingJob.id == job_id)
+                    .values(
+                        status="stopped",
+                        updated_at=datetime.now(timezone.utc)
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                
+                if result.rowcount == 0:
+                    return False
+            
+            # Publish polling event
+            await self.kafka_producer.publish_polling_event(
+                job_id=job_id,
+                symbols=[],
+                interval=0,
+                status="stopped"
+            )
+            
+            logger.info(f"Stopped polling job {job_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error stopping polling job {job_id}: {e}")
+            return False
+    
+    async def get_job_status(self, job_id: str) -> Optional[Dict]:
+        """Get the status of a polling job."""
+        try:
+            async with get_async_session() as session:
+                stmt = select(PollingJob).where(PollingJob.id == job_id)
+                result = await session.execute(stmt)
+                job = result.scalar_one_or_none()
+                
+                if not job:
+                    return None
+                
+                return {
+                    "job_id": job.id,
+                    "symbols": job.symbols,
+                    "interval": job.interval,
+                    "provider": job.provider,
+                    "status": job.status,
+                    "created_at": job.created_at.isoformat(),
+                    "last_run": job.last_run.isoformat() if job.last_run else None,
+                    "error_message": job.error_message,
+                    "is_running": job_id in self.active_jobs
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting job status for {job_id}: {e}")
+            return None
+    
+    async def list_active_jobs(self) -> List[Dict]:
+        """List all active polling jobs."""
+        try:
+            async with get_async_session() as session:
+                stmt = (
+                    select(PollingJob)
+                    .where(PollingJob.status == "active")
+                    .order_by(PollingJob.created_at.desc())
+                )
+                result = await session.execute(stmt)
+                jobs = result.scalars().all()
+                
+                return [
+                    {
+                        "job_id": job.id,
+                        "symbols": job.symbols,
+                        "interval": job.interval,
+                        "provider": job.provider,
+                        "status": job.status,
+                        "created_at": job.created_at.isoformat(),
+                        "last_run": job.last_run.isoformat() if job.last_run else None,
+                        "is_running": job.id in self.active_jobs
+                    }
+                    for job in jobs
+                ]
+                
+        except Exception as e:
+            logger.error(f"Error listing active jobs: {e}")
+            return []
+    
+    async def restore_active_jobs(self):
+        """Restore active jobs from database on startup."""
+        try:
+            active_jobs = await self.list_active_jobs()
+            
+            for job_data in active_jobs:
+                job_id = job_data["job_id"]
+                
+                # Skip if already running
+                if job_id in self.active_jobs:
+                    continue
+                
+                # Start polling task
+                task = asyncio.create_task(
+                    self._polling_task(
+                        job_id,
+                        job_data["symbols"],
+                        job_data["interval"],
+                        job_data["provider"]
+                    )
+                )
+                self.active_jobs[job_id] = task
+                
+                logger.info(f"Restored polling job {job_id}")
+            
+            logger.info(f"Restored {len(active_jobs)} active polling jobs")
+            
+        except Exception as e:
+            logger.error(f"Error restoring active jobs: {e}")
+    
+    async def shutdown(self):
+        """Shutdown all polling jobs."""
+        logger.info("Shutting down polling service...")
+        
+        # Cancel all active tasks
+        for job_id, task in list(self.active_jobs.items()):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        self.active_jobs.clear()
+        logger.info("Polling service shutdown complete")
+
+
+# Global service instance
+_polling_service = None
+
+
+def get_polling_service() -> PollingService:
+    """Get or create polling service instance."""
+    global _polling_service
+    if _polling_service is None:
+        _polling_service = PollingService()
+    return _polling_service
