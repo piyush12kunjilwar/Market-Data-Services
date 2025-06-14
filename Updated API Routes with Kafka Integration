@@ -1,0 +1,277 @@
+"""
+Updated API Routes with Kafka Integration
+app/api/routes/prices.py
+"""
+import logging
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.database import get_session
+from app.services.price_service import PriceService
+from app.services.market_providers.factory import get_market_provider
+from app.services.kafka_producer import get_kafka_producer, KafkaProducerService
+from app.core.cache import get_cache_service, CacheService
+from app.schemas.market_data import (
+    PriceResponse, 
+    PollRequest, 
+    PollResponse,
+    MovingAverageResponse
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+async def get_price_service(
+    market_provider=Depends(get_market_provider),
+    kafka_producer: KafkaProducerService = Depends(get_kafka_producer),
+    cache_service: CacheService = Depends(get_cache_service)
+) -> PriceService:
+    """Dependency injection for PriceService"""
+    return PriceService(market_provider, kafka_producer, cache_service)
+
+@router.get("/latest", response_model=PriceResponse)
+async def get_latest_price(
+    symbol: str,
+    provider: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    price_service: PriceService = Depends(get_price_service)
+):
+    """
+    Get the latest price for a symbol
+    
+    Args:
+        symbol: Stock symbol (e.g., AAPL)
+        provider: Market data provider (optional)
+        
+    Returns:
+        Latest price data
+        
+    Raises:
+        HTTPException: If symbol not found or service error
+    """
+    try:
+        result = await price_service.get_latest_price(
+            session=session,
+            symbol=symbol.upper(),
+            provider=provider
+        )
+        
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Price data not found for symbol: {symbol}"
+            )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting latest price for {symbol}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while fetching price data"
+        )
+
+@router.post("/poll", response_model=PollResponse, status_code=202)
+async def create_poll_job(
+    poll_request: PollRequest,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    price_service: PriceService = Depends(get_price_service)
+):
+    """
+    Create a polling job for multiple symbols
+    
+    Args:
+        poll_request: Polling configuration
+        
+    Returns:
+        Poll job details with accepted status
+        
+    Raises:
+        HTTPException: If job creation fails
+    """
+    try:
+        # Validate symbols
+        symbols = [symbol.upper() for symbol in poll_request.symbols]
+        
+        # Create poll job
+        job_id = await price_service.create_poll_job(
+            session=session,
+            symbols=symbols,
+            interval=poll_request.interval,
+            provider=poll_request.provider
+        )
+        
+        if not job_id:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create polling job"
+            )
+        
+        # Add background task for actual polling
+        background_tasks.add_task(
+            execute_poll_job,
+            job_id,
+            symbols,
+            poll_request.interval,
+            price_service
+        )
+        
+        return PollResponse(
+            job_id=job_id,
+            status="accepted",
+            config={
+                "symbols": symbols,
+                "interval": poll_request.interval,
+                "provider": poll_request.provider
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating poll job: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while creating poll job"
+        )
+
+@router.get("/poll/{job_id}")
+async def get_poll_job_status(
+    job_id: str,
+    session: AsyncSession = Depends(get_session),
+    price_service: PriceService = Depends(get_price_service)
+):
+    """
+    Get the status of a polling job
+    
+    Args:
+        job_id: Polling job ID
+        
+    Returns:
+        Job status and configuration
+        
+    Raises:
+        HTTPException: If job not found
+    """
+    try:
+        result = await price_service.get_poll_job_status(session, job_id)
+        
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Poll job not found: {job_id}"
+            )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting poll job status: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while fetching job status"
+        )
+
+@router.get("/moving-average/{symbol}", response_model=MovingAverageResponse)
+async def get_moving_average(
+    symbol: str,
+    window_size: int = 5,
+    session: AsyncSession = Depends(get_session),
+    price_service: PriceService = Depends(get_price_service)
+):
+    """
+    Get the latest moving average for a symbol
+    
+    Args:
+        symbol: Stock symbol
+        window_size: Moving average window size (default: 5)
+        
+    Returns:
+        Moving average data
+        
+    Raises:
+        HTTPException: If data not found
+    """
+    try:
+        result = await price_service.get_moving_average(
+            session=session,
+            symbol=symbol.upper(),
+            window_size=window_size
+        )
+        
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Moving average not found for symbol: {symbol}"
+            )
+        
+        return MovingAverageResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting moving average for {symbol}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while fetching moving average"
+        )
+
+async def execute_poll_job(
+    job_id: str,
+    symbols: List[str],
+    interval: int,
+    price_service: PriceService
+):
+    """
+    Background task to execute polling job
+    
+    Args:
+        job_id: Job ID
+        symbols: List of symbols to poll
+        interval: Polling interval
+        price_service: Price service instance
+    """
+    import asyncio
+    
+    logger.info(f"Starting poll job {job_id} for symbols: {symbols}")
+    
+    try:
+        # For demo purposes, poll each symbol once
+        # In production, this would be a scheduled job with proper job management
+        async for session in get_session():
+            for symbol in symbols:
+                try:
+                    result = await price_service.get_latest_price(
+                        session=session,
+                        symbol=symbol,
+                        use_cache=False  # Force fresh data for polling
+                    )
+                    
+                    if result:
+                        logger.info(f"Polled {symbol}: ${result.price}")
+                    else:
+                        logger.warning(f"Failed to poll {symbol}")
+                        
+                    # Respect rate limits
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error polling {symbol}: {str(e)}")
+                    
+        logger.info(f"Completed poll job {job_id}")
+        
+    except Exception as e:
+        logger.error(f"Error executing poll job {job_id}: {str(e)}")
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "market-data-api",
+        "timestamp": "2024-03-20T10:30:00Z"
+    }
