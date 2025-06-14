@@ -1,0 +1,250 @@
+# tests/test_services.py
+import pytest
+from unittest.mock import Mock, patch, AsyncMock
+from datetime import datetime
+import asyncio
+
+from app.services.market_data_service import MarketDataService
+from app.services.kafka_producer import KafkaProducerService
+from app.services.polling_service import PollingService
+from app.core.config import settings
+
+
+class TestMarketDataService:
+    
+    @pytest.fixture
+    def mock_db_session(self):
+        return Mock()
+    
+    @pytest.fixture
+    def market_service(self, mock_db_session):
+        return MarketDataService(mock_db_session)
+    
+    @patch('app.services.market_data_service.requests.get')
+    async def test_fetch_price_alpha_vantage_success(self, mock_get, market_service):
+        # Mock successful API response
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Global Quote": {
+                "01. symbol": "AAPL",
+                "05. price": "150.25",
+                "07. latest trading day": "2024-03-20"
+            }
+        }
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        result = await market_service.fetch_price("AAPL", "alpha_vantage")
+        
+        assert result["symbol"] == "AAPL"
+        assert result["price"] == 150.25
+        assert result["provider"] == "alpha_vantage"
+        assert "timestamp" in result
+    
+    @patch('app.services.market_data_service.yf.Ticker')
+    async def test_fetch_price_yahoo_success(self, mock_ticker, market_service):
+        # Mock Yahoo Finance response
+        mock_ticker_instance = Mock()
+        mock_ticker_instance.history.return_value.tail.return_value = {
+            'Close': [145.30]
+        }
+        mock_ticker.return_value = mock_ticker_instance
+        
+        result = await market_service.fetch_price("AAPL", "yahoo")
+        
+        assert result["symbol"] == "AAPL"
+        assert result["price"] == 145.30
+        assert result["provider"] == "yahoo"
+    
+    async def test_calculate_moving_average(self, market_service):
+        prices = [100.0, 101.0, 99.0, 102.0, 98.0]
+        result = market_service.calculate_moving_average(prices)
+        expected = sum(prices) / len(prices)
+        assert result == expected
+    
+    async def test_calculate_moving_average_empty_list(self, market_service):
+        result = market_service.calculate_moving_average([])
+        assert result == 0.0
+
+
+class TestKafkaProducerService:
+    
+    @pytest.fixture
+    def kafka_producer(self):
+        return KafkaProducerService()
+    
+    @patch('app.services.kafka_producer.Producer')
+    async def test_produce_price_event_success(self, mock_producer_class, kafka_producer):
+        mock_producer = Mock()
+        mock_producer_class.return_value = mock_producer
+        
+        price_data = {
+            "symbol": "AAPL",
+            "price": 150.25,
+            "timestamp": "2024-03-20T10:30:00Z",
+            "provider": "alpha_vantage"
+        }
+        
+        await kafka_producer.produce_price_event(price_data)
+        
+        mock_producer.produce.assert_called_once()
+        mock_producer.flush.assert_called_once()
+    
+    @patch('app.services.kafka_producer.Producer')
+    async def test_produce_price_event_failure(self, mock_producer_class, kafka_producer):
+        mock_producer = Mock()
+        mock_producer.produce.side_effect = Exception("Kafka error")
+        mock_producer_class.return_value = mock_producer
+        
+        price_data = {
+            "symbol": "AAPL",
+            "price": 150.25,
+            "timestamp": "2024-03-20T10:30:00Z",
+            "provider": "alpha_vantage"
+        }
+        
+        with pytest.raises(Exception, match="Kafka error"):
+            await kafka_producer.produce_price_event(price_data)
+
+
+class TestPollingService:
+    
+    @pytest.fixture
+    def mock_db_session(self):
+        return Mock()
+    
+    @pytest.fixture
+    def mock_market_service(self):
+        return Mock()
+    
+    @pytest.fixture
+    def mock_kafka_producer(self):
+        return Mock()
+    
+    @pytest.fixture
+    def polling_service(self, mock_db_session, mock_market_service, mock_kafka_producer):
+        return PollingService(mock_db_session, mock_market_service, mock_kafka_producer)
+    
+    async def test_start_polling_job(self, polling_service, mock_market_service, mock_kafka_producer):
+        # Mock market service response
+        mock_market_service.fetch_price = AsyncMock(return_value={
+            "symbol": "AAPL",
+            "price": 150.25,
+            "timestamp": "2024-03-20T10:30:00Z",
+            "provider": "alpha_vantage"
+        })
+        
+        # Mock kafka producer
+        mock_kafka_producer.produce_price_event = AsyncMock()
+        
+        job_config = {
+            "symbols": ["AAPL"],
+            "interval": 1,  # 1 second for testing
+            "provider": "alpha_vantage"
+        }
+        
+        # Start polling for a short duration
+        task = asyncio.create_task(
+            polling_service.start_polling_job("test_job", job_config)
+        )
+        
+        # Let it run for a bit then cancel
+        await asyncio.sleep(2)
+        task.cancel()
+        
+        # Verify market service was called
+        assert mock_market_service.fetch_price.called
+        assert mock_kafka_producer.produce_price_event.called
+
+
+# tests/test_utils.py
+import pytest
+from datetime import datetime
+from app.utils.helpers import format_timestamp, validate_symbol, calculate_percentage_change
+
+
+class TestUtils:
+    
+    def test_format_timestamp(self):
+        dt = datetime(2024, 3, 20, 10, 30, 0)
+        result = format_timestamp(dt)
+        assert result == "2024-03-20T10:30:00Z"
+    
+    def test_validate_symbol_valid(self):
+        assert validate_symbol("AAPL") == True
+        assert validate_symbol("MSFT") == True
+        assert validate_symbol("GOOGL") == True
+    
+    def test_validate_symbol_invalid(self):
+        assert validate_symbol("") == False
+        assert validate_symbol("123") == False
+        assert validate_symbol("TOOLONG") == False
+        assert validate_symbol("aa") == False
+    
+    def test_calculate_percentage_change(self):
+        result = calculate_percentage_change(100, 110)
+        assert result == 10.0
+        
+        result = calculate_percentage_change(100, 90)
+        assert result == -10.0
+        
+        result = calculate_percentage_change(0, 100)
+        assert result == 0.0  # Handle division by zero
+
+
+# tests/conftest.py
+import pytest
+import asyncio
+from httpx import AsyncClient
+from app.main import app
+from app.core.database import get_db
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from app.models.base import Base
+
+# Test database setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def override_get_db():
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        db.close()
+
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for the test session."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="function")
+async def client():
+    # Create test database tables
+    Base.metadata.create_all(bind=engine)
+    
+    # Override the dependency
+    app.dependency_overrides[get_db] = override_get_db
+    
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        yield ac
+    
+    # Clean up
+    Base.metadata.drop_all(bind=engine)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def sample_price_data():
+    return {
+        "symbol": "AAPL",
+        "price": 150.25,
+        "timestamp": "2024-03-20T10:30:00Z",
+        "provider": "alpha_vantage"
+    }
