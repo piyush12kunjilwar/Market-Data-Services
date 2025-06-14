@@ -1,0 +1,10 @@
+# Add all service files
+git add app/services/
+git commit -m "feat: implement core market data services
+
+- Add Kafka consumer service with moving average calculation
+- Add Kafka producer service with topic management
+- Implement market data service with multiple providers (Alpha Vantage, Yahoo Finance, Finnhub)
+- Add polling service for scheduled data fetching
+- Integrate database storage and Redis caching
+- Add comprehensive error handling and logging"
