@@ -1,0 +1,14 @@
+# Add all Docker-related files
+git add docker-compose.yml
+git add docker-compose.dev.yml
+git add Dockerfile.dev
+git add .env.docker
+git add scripts/
+git commit -m "feat: add Docker configuration and startup scripts
+
+- Add production docker-compose.yml with all services
+- Add development docker-compose override
+- Create database initialization script
+- Add startup and setup scripts
+- Configure environment variables for Docker
+- Add health checks for all services"
