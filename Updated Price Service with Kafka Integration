@@ -1,0 +1,285 @@
+"""
+Updated Price Service with Kafka Integration
+"""
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+from app.models.market_data import PriceData, RawMarketData, PollJob
+from app.schemas.market_data import PriceResponse, PriceEvent
+from app.services.market_providers.base import MarketDataProvider
+from app.services.kafka_producer import KafkaProducerService
+from app.core.cache import CacheService
+
+logger = logging.getLogger(__name__)
+
+class PriceService:
+    def __init__(
+        self, 
+        market_provider: MarketDataProvider,
+        kafka_producer: KafkaProducerService,
+        cache_service: CacheService
+    ):
+        self.market_provider = market_provider
+        self.kafka_producer = kafka_producer
+        self.cache_service = cache_service
+
+    async def get_latest_price(
+        self,
+        session: AsyncSession,
+        symbol: str,
+        provider: Optional[str] = None,
+        use_cache: bool = True
+    ) -> Optional[PriceResponse]:
+        """
+        Get latest price for a symbol with caching and Kafka integration
+        
+        Args:
+            session: Database session
+            symbol: Stock symbol
+            provider: Market data provider (optional)
+            use_cache: Whether to use cache
+            
+        Returns:
+            PriceResponse or None
+        """
+        cache_key = f"price:{symbol}:{provider or 'default'}"
+        
+        # Try cache first
+        if use_cache:
+            cached_price = await self.cache_service.get(cache_key)
+            if cached_price:
+                logger.info(f"Cache hit for {symbol}")
+                return PriceResponse(**cached_price)
+        
+        try:
+            # Check database for recent data (within last 5 minutes)
+            recent_threshold = datetime.now(timezone.utc).timestamp() - 300  # 5 minutes
+            
+            stmt = (
+                select(PriceData)
+                .where(PriceData.symbol == symbol)
+                .where(PriceData.timestamp >= datetime.fromtimestamp(recent_threshold, timezone.utc))
+                .order_by(desc(PriceData.timestamp))
+                .limit(1)
+            )
+            
+            result = await session.execute(stmt)
+            price_data = result.scalar_one_or_none()
+            
+            if price_data:
+                logger.info(f"Found recent price in database for {symbol}")
+                price_response = PriceResponse(
+                    symbol=price_data.symbol,
+                    price=price_data.price,
+                    timestamp=price_data.timestamp,
+                    provider=price_data.provider
+                )
+                
+                # Cache the result
+                if use_cache:
+                    await self.cache_service.set(
+                        cache_key, 
+                        price_response.dict(), 
+                        expire=300  # 5 minutes
+                    )
+                
+                return price_response
+            
+            # Fetch from external provider
+            logger.info(f"Fetching fresh data for {symbol} from {self.market_provider.name}")
+            market_data = await self.market_provider.get_price(symbol)
+            
+            if not market_data:
+                logger.warning(f"No data received for {symbol}")
+                return None
+            
+            # Store raw response
+            raw_data = RawMarketData(
+                id=str(uuid.uuid4()),
+                symbol=symbol,
+                provider=self.market_provider.name,
+                raw_response=market_data,
+                timestamp=datetime.now(timezone.utc)
+            )
+            session.add(raw_data)
+            
+            # Extract price data
+            price = market_data.get('price') or market_data.get('regularMarketPrice')
+            if not price:
+                logger.error(f"Could not extract price from market data for {symbol}")
+                return None
+            
+            # Store processed price data
+            price_data = PriceData(
+                symbol=symbol,
+                price=float(price),
+                provider=self.market_provider.name,
+                timestamp=datetime.now(timezone.utc),
+                raw_response_id=raw_data.id
+            )
+            session.add(price_data)
+            
+            # Commit to database
+            await session.commit()
+            
+            # Create price response
+            price_response = PriceResponse(
+                symbol=price_data.symbol,
+                price=price_data.price,
+                timestamp=price_data.timestamp,
+                provider=price_data.provider
+            )
+            
+            # Cache the result
+            if use_cache:
+                await self.cache_service.set(
+                    cache_key, 
+                    price_response.dict(), 
+                    expire=300  # 5 minutes
+                )
+            
+            # Produce Kafka event
+            price_event = PriceEvent(
+                symbol=price_data.symbol,
+                price=price_data.price,
+                timestamp=price_data.timestamp,
+                source=price_data.provider,
+                raw_response_id=raw_data.id
+            )
+            
+            await self.kafka_producer.produce_price_event(price_event)
+            
+            logger.info(f"Successfully fetched and stored price for {symbol}: ${price}")
+            return price_response
+            
+        except Exception as e:
+            logger.error(f"Error getting latest price for {symbol}: {str(e)}")
+            await session.rollback()
+            return None
+
+    async def create_poll_job(
+        self,
+        session: AsyncSession,
+        symbols: list[str],
+        interval: int,
+        provider: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Create a new polling job
+        
+        Args:
+            session: Database session
+            symbols: List of symbols to poll
+            interval: Polling interval in seconds
+            provider: Market data provider
+            
+        Returns:
+            Job ID if successful, None otherwise
+        """
+        try:
+            job_id = f"poll_{uuid.uuid4().hex[:8]}"
+            
+            poll_job = PollJob(
+                job_id=job_id,
+                symbols=symbols,
+                interval=interval,
+                provider=provider or self.market_provider.name,
+                status="accepted",
+                created_at=datetime.now(timezone.utc)
+            )
+            
+            session.add(poll_job)
+            await session.commit()
+            
+            logger.info(f"Created poll job {job_id} for symbols: {symbols}")
+            return job_id
+            
+        except Exception as e:
+            logger.error(f"Error creating poll job: {str(e)}")
+            await session.rollback()
+            return None
+
+    async def get_poll_job_status(
+        self,
+        session: AsyncSession,
+        job_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get status of a polling job
+        
+        Args:
+            session: Database session
+            job_id: Job ID
+            
+        Returns:
+            Job status dict or None
+        """
+        try:
+            stmt = select(PollJob).where(PollJob.job_id == job_id)
+            result = await session.execute(stmt)
+            poll_job = result.scalar_one_or_none()
+            
+            if not poll_job:
+                return None
+            
+            return {
+                "job_id": poll_job.job_id,
+                "status": poll_job.status,
+                "symbols": poll_job.symbols,
+                "interval": poll_job.interval,
+                "provider": poll_job.provider,
+                "created_at": poll_job.created_at,
+                "updated_at": poll_job.updated_at
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting poll job status: {str(e)}")
+            return None
+
+    async def get_moving_average(
+        self,
+        session: AsyncSession,
+        symbol: str,
+        window_size: int = 5
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get latest moving average for a symbol
+        
+        Args:
+            session: Database session
+            symbol: Stock symbol
+            window_size: Moving average window size
+            
+        Returns:
+            Moving average data or None
+        """
+        try:
+            from app.models.market_data import MovingAverage
+            
+            stmt = (
+                select(MovingAverage)
+                .where(MovingAverage.symbol == symbol)
+                .where(MovingAverage.window_size == window_size)
+                .order_by(desc(MovingAverage.timestamp))
+                .limit(1)
+            )
+            
+            result = await session.execute(stmt)
+            ma_data = result.scalar_one_or_none()
+            
+            if not ma_data:
+                return None
+            
+            return {
+                "symbol": ma_data.symbol,
+                "moving_average": ma_data.moving_average,
+                "window_size": ma_data.window_size,
+                "timestamp": ma_data.timestamp
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting moving average for {symbol}: {str(e)}")
+            return None
