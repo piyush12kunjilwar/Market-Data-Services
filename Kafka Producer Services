@@ -1,0 +1,153 @@
+"""
+Kafka Producer Service for publishing market data events.
+"""
+import json
+import logging
+from typing import Dict, Optional
+from datetime import datetime
+
+from confluent_kafka import Producer, KafkaException
+from confluent_kafka.admin import AdminClient, NewTopic
+
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class KafkaProducerService:
+    """Service for producing messages to Kafka topics."""
+    
+    def __init__(self):
+        self.settings = get_settings()
+        self.producer = None
+        self.admin_client = None
+        self.setup_producer()
+        self.setup_admin_client()
+    
+    def setup_producer(self):
+        """Setup Kafka producer configuration."""
+        producer_config = {
+            'bootstrap.servers': self.settings.kafka_bootstrap_servers,
+            'acks': 'all',  # Wait for all replicas to acknowledge
+            'retries': 3,
+            'retry.backoff.ms': 100,
+            'batch.size': 16384,
+            'linger.ms': 10,
+            'buffer.memory': 33554432,
+            'compression.type': 'snappy',
+            'max.in.flight.requests.per.connection': 5,
+            'enable.idempotence': True,
+        }
+        
+        self.producer = Producer(producer_config)
+        logger.info("Kafka producer configured")
+    
+    def setup_admin_client(self):
+        """Setup Kafka admin client for topic management."""
+        admin_config = {
+            'bootstrap.servers': self.settings.kafka_bootstrap_servers,
+        }
+        self.admin_client = AdminClient(admin_config)
+        logger.info("Kafka admin client configured")
+    
+    async def ensure_topic_exists(self, topic_name: str, num_partitions: int = 1, replication_factor: int = 1):
+        """Ensure a Kafka topic exists, create if it doesn't."""
+        try:
+            # Check if topic exists
+            metadata = self.admin_client.list_topics(timeout=10)
+            
+            if topic_name not in metadata.topics:
+                logger.info(f"Creating Kafka topic: {topic_name}")
+                
+                # Create topic
+                topic = NewTopic(
+                    topic=topic_name,
+                    num_partitions=num_partitions,
+                    replication_factor=replication_factor
+                )
+                
+                # Create topic
+                fs = self.admin_client.create_topics([topic])
+                
+                # Wait for topic creation
+                for topic, f in fs.items():
+                    try:
+                        f.result()  # The result itself is None
+                        logger.info(f"Topic {topic} created successfully")
+                    except Exception as e:
+                        logger.error(f"Failed to create topic {topic}: {e}")
+            else:
+                logger.debug(f"Topic {topic_name} already exists")
+                
+        except Exception as e:
+            logger.error(f"Error checking/creating topic {topic_name}: {e}")
+    
+    def delivery_report(self, err, msg):
+        """Delivery report callback for producer."""
+        if err is not None:
+            logger.error(f"Message delivery failed: {err}")
+        else:
+            logger.debug(f"Message delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
+    
+    async def publish_price_event(
+        self,
+        symbol: str,
+        price: float,
+        timestamp: datetime,
+        source: str,
+        raw_response_id: Optional[str] = None
+    ) -> bool:
+        """Publish a price event to Kafka."""
+        try:
+            # Ensure topic exists
+            await self.ensure_topic_exists('price-events')
+            
+            # Prepare message
+            message_data = {
+                'symbol': symbol,
+                'price': price,
+                'timestamp': timestamp.isoformat(),
+                'source': source,
+                'raw_response_id': raw_response_id
+            }
+            
+            # Serialize message
+            message_json = json.dumps(message_data)
+            
+            # Produce message
+            self.producer.produce(
+                topic='price-events',
+                key=symbol,  # Use symbol as key for partitioning
+                value=message_json,
+                callback=self.delivery_report
+            )
+            
+            # Trigger delivery report callbacks
+            self.producer.poll(0)
+            
+            logger.info(f"Published price event for {symbol}: ${price}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error publishing price event for {symbol}: {e}", exc_info=True)
+            return False
+    
+    async def publish_polling_event(
+        self,
+        job_id: str,
+        symbols: list,
+        interval: int,
+        status: str
+    ) -> bool:
+        """Publish a polling job event to Kafka."""
+        try:
+            # Ensure topic exists
+            await self.ensure_topic_exists('polling-events')
+            
+            # Prepare message
+            message_data = {
+                'job_id': job_id,
+                'symbols': symbols,
+                'interval': interval,
+                'status': status,
+                '
