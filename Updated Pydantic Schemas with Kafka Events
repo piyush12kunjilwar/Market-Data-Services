@@ -1,0 +1,27 @@
+"""
+Updated Pydantic Schemas with Kafka Events
+app/schemas/market_data.py
+"""
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, validator
+
+class PriceResponse(BaseModel):
+    """Response schema for price data"""
+    symbol: str = Field(..., description="Stock symbol")
+    price: float = Field(..., description="Current price")
+    timestamp: datetime = Field(..., description="Timestamp of the price")
+    provider: str = Field(..., description="Data provider name")
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+class PriceEvent(BaseModel):
+    """Kafka message schema for price events"""
+    symbol: str = Field(..., description="Stock symbol")
+    price: float = Field(..., description="Price value")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    source: str = Field(..., description="Data source/provider")
+    raw_response_id: str =
