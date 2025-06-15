@@ -1,0 +1,347 @@
+openapi: 3.0.3
+info:
+  title: Market Data Service API
+  description: |
+    A production-ready microservice for fetching and processing market data.
+    
+    ## Features
+    - Real-time price fetching from multiple providers
+    - Scheduled polling for continuous data updates
+    - Moving average calculations via Kafka pipeline
+    - RESTful API with comprehensive error handling
+    
+    ## Rate Limits
+    - Alpha Vantage: 5 requests per minute
+    - Yahoo Finance: 2000 requests per hour
+    - Finnhub: 60 requests per minute
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: support@marketdata.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+  - url: https://api.marketdata.com
+    description: Production server
+
+tags:
+  - name: prices
+    description: Market price operations
+  - name: health
+    description: Health check endpoints
+
+paths:
+  /prices/latest:
+    get:
+      tags:
+        - prices
+      summary: Get latest price for a symbol
+      description: Retrieves the most recent price for a given stock symbol
+      operationId: getLatestPrice
+      parameters:
+        - name: symbol
+          in: query
+          description: Stock symbol (e.g., AAPL, MSFT)
+          required: true
+          schema:
+            type: string
+            pattern: ^[A-Z]{1,10}$
+            example: AAPL
+        - name: provider
+          in: query
+          description: Data provider to use
+          required: false
+          schema:
+            type: string
+            enum:
+              - alpha_vantage
+              - yahoo_finance
+              - finnhub
+            default: alpha_vantage
+      responses:
+        '200':
+          description: Successfully retrieved price
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceResponse'
+              examples:
+                apple:
+                  value:
+                    symbol: AAPL
+                    price: 150.25
+                    timestamp: "2024-03-20T10:30:00Z"
+                    provider: alpha_vantage
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /prices/poll:
+    post:
+      tags:
+        - prices
+      summary: Create a polling job
+      description: Schedules periodic price fetching for specified symbols
+      operationId: createPollingJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PollRequest'
+            examples:
+              multipleSymbols:
+                value:
+                  symbols: ["AAPL", "MSFT", "GOOGL"]
+                  interval: 60
+                  provider: alpha_vantage
+      responses:
+        '202':
+          description: Polling job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollResponse'
+              examples:
+                jobCreated:
+                  value:
+                    job_id: poll_123
+                    status: accepted
+                    config:
+                      symbols: ["AAPL", "MSFT"]
+                      interval: 60
+                      provider: alpha_vantage
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Returns the health status of the service
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+    PriceResponse:
+      type: object
+      required:
+        - symbol
+        - price
+        - timestamp
+        - provider
+      properties:
+        symbol:
+          type: string
+          description: Stock symbol
+          example: AAPL
+        price:
+          type: number
+          format: float
+          description: Current price
+          example: 150.25
+        timestamp:
+          type: string
+          format: date-time
+          description: Price timestamp
+          example: "2024-03-20T10:30:00Z"
+        provider:
+          type: string
+          description: Data provider used
+          example: alpha_vantage
+
+    PollRequest:
+      type: object
+      required:
+        - symbols
+        - interval
+      properties:
+        symbols:
+          type: array
+          items:
+            type: string
+            pattern: ^[A-Z]{1,10}$
+          minItems: 1
+          maxItems: 10
+          description: List of stock symbols to poll
+          example: ["AAPL", "MSFT"]
+        interval:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Polling interval in seconds
+          example: 300
+        provider:
+          type: string
+          enum:
+            - alpha_vantage
+            - yahoo_finance
+            - finnhub
+          default: alpha_vantage
+          description: Data provider to use
+
+    PollResponse:
+      type: object
+      required:
+        - job_id
+        - status
+        - config
+      properties:
+        job_id:
+          type: string
+          description: Unique job identifier
+          example: poll_123
+        status:
+          type: string
+          enum:
+            - accepted
+            - running
+            - completed
+            - failed
+          description: Job status
+          example: accepted
+        config:
+          type: object
+          properties:
+            symbols:
+              type: array
+              items:
+                type: string
+            interval:
+              type: integer
+            provider:
+              type: string
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - timestamp
+        - services
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - degraded
+            - unhealthy
+          example: healthy
+        timestamp:
+          type: string
+          format: date-time
+        services:
+          type: object
+          properties:
+            database:
+              type: string
+              enum: [up, down]
+            kafka:
+              type: string
+              enum: [up, down]
+            cache:
+              type: string
+              enum: [up, down]
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+        - timestamp
+      properties:
+        error:
+          type: string
+          description: Error type
+          example: ValidationError
+        message:
+          type: string
+          description: Error message
+          example: Invalid symbol format
+        timestamp:
+          type: string
+          format: date-time
+        details:
+          type: object
+          additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalidSymbol:
+              value:
+                error: ValidationError
+                message: Symbol must be uppercase letters only
+                timestamp: "2024-03-20T10:30:00Z"
+                details:
+                  field: symbol
+                  value: "123"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            symbolNotFound:
+              value:
+                error: NotFoundError
+                message: Symbol not found in market data
+                timestamp: "2024-03-20T10:30:00Z"
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rateLimitExceeded:
+              value:
+                error: RateLimitError
+                message: API rate limit exceeded
+                timestamp: "2024-03-20T10:30:00Z"
+                details:
+                  retry_after: 60
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication (optional)
+
+security:
+  - {}
+  - ApiKeyAuth: []
