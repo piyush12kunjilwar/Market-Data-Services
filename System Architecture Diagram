@@ -1,0 +1,238 @@
+# Architecture Diagrams
+
+## System Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Market Data Service"
+        API["FastAPI Service<br/>Port: 8000"]
+        DB[(PostgreSQL<br/>Port: 5432)]
+        Cache[("Redis Cache<br/>Port: 6379")]
+    end
+    
+    subgraph "Message Queue"
+        Kafka["Apache Kafka<br/>Port: 29092"]
+        ZK["ZooKeeper<br/>Port: 2181"]
+        Producer["Price Producer"]
+        Consumer["MA Consumer"]
+    end
+    
+    subgraph "External Services"
+        MarketAPI["Market Data API<br/>(Alpha Vantage/YFinance/Finnhub)"]
+    end
+    
+    subgraph "Monitoring"
+        Prometheus["Prometheus<br/>[Optional]"]
+        Grafana["Grafana<br/>[Optional]"]
+    end
+    
+    Client["Client Application"] -->|HTTP Request| API
+    API -->|Query/Store| DB
+    API -->|Cache Read/Write| Cache
+    API -->|Fetch Prices| MarketAPI
+    
+    API -->|Publish Event| Producer
+    Producer -->|Send Message| Kafka
+    Kafka -->|Consume Message| Consumer
+    Consumer -->|Store MA| DB
+    
+    ZK <-->|Coordination| Kafka
+    
+    API -->|Metrics| Prometheus
+    Prometheus -->|Visualize| Grafana
+    
+    style API fill:#f9f,stroke:#333,stroke-width:4px
+    style Kafka fill:#ff9,stroke:#333,stroke-width:2px
+    style DB fill:#9ff,stroke:#333,stroke-width:2px
+```
+
+## Data Flow Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as FastAPI
+    participant R as Redis Cache
+    participant M as Market API
+    participant P as PostgreSQL
+    participant K as Kafka
+    participant MA as MA Consumer
+    
+    C->>A: GET /prices/latest?symbol=AAPL
+    A->>R: Check cache for symbol
+    
+    alt Cache Hit
+        R-->>A: Return cached price
+        A-->>C: Return price response
+    else Cache Miss
+        A->>M: Fetch latest price
+        M-->>A: Price data
+        A->>P: Store raw response
+        A->>R: Update cache
+        A->>K: Publish price event
+        A-->>C: Return price response
+    end
+    
+    Note over K,MA: Asynchronous Processing
+    K->>MA: Consume price event
+    MA->>P: Fetch last 5 prices
+    P-->>MA: Historical prices
+    MA->>MA: Calculate 5-point MA
+    MA->>P: Store MA result
+```
+
+## Component Interaction Diagram
+
+```mermaid
+graph LR
+    subgraph "API Layer"
+        Routes[API Routes]
+        Deps[Dependencies]
+        Mid[Middleware]
+    end
+    
+    subgraph "Service Layer"
+        MS[Market Service]
+        PS[Polling Service]
+        KP[Kafka Producer]
+    end
+    
+    subgraph "Data Layer"
+        Models[DB Models]
+        Schemas[Pydantic Schemas]
+        Providers[Market Providers]
+    end
+    
+    Routes --> Deps
+    Routes --> MS
+    Routes --> PS
+    
+    MS --> Providers
+    MS --> Models
+    MS --> KP
+    
+    PS --> MS
+    PS --> Models
+    
+    KP --> Schemas
+    
+    Deps --> Models
+    Mid --> Routes
+```
+
+## Database Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    RAW_MARKET_DATA {
+        uuid id PK
+        varchar symbol
+        varchar provider
+        jsonb raw_response
+        timestamp created_at
+    }
+    
+    PRICE_POINTS {
+        uuid id PK
+        varchar symbol
+        decimal price
+        timestamp timestamp
+        varchar provider
+        uuid raw_data_id FK
+    }
+    
+    SYMBOL_AVERAGES {
+        uuid id PK
+        varchar symbol
+        decimal moving_average_5
+        timestamp calculated_at
+        jsonb data_points
+    }
+    
+    POLLING_JOBS {
+        uuid id PK
+        varchar job_id UK
+        jsonb symbols
+        integer interval
+        varchar provider
+        varchar status
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    RAW_MARKET_DATA ||--o{ PRICE_POINTS : generates
+    PRICE_POINTS ||--o{ SYMBOL_AVERAGES : calculates
+    POLLING_JOBS ||--o{ PRICE_POINTS : creates
+```
+
+## Kafka Message Flow
+
+```mermaid
+graph TD
+    subgraph "Producers"
+        API[FastAPI Service]
+        Poll[Polling Service]
+    end
+    
+    subgraph "Kafka Topics"
+        PE[price-events]
+        PJ[polling-jobs]
+    end
+    
+    subgraph "Consumers"
+        MAC[MA Calculator]
+        PJC[Poll Job Consumer]
+    end
+    
+    subgraph "Message Schema"
+        MSG["{<br/>symbol: string,<br/>price: number,<br/>timestamp: string,<br/>source: string,<br/>raw_response_id: uuid<br/>}"]
+    end
+    
+    API -->|Publish| PE
+    Poll -->|Publish| PE
+    PE -->|Subscribe| MAC
+    
+    API -->|Publish| PJ
+    PJ -->|Subscribe| PJC
+    
+    MSG -.->|Format| PE
+```
+
+## Deployment Architecture
+
+```mermaid
+graph TB
+    subgraph "Development"
+        DevDocker[Docker Compose]
+        DevDB[(PostgreSQL)]
+        DevKafka[Kafka]
+    end
+    
+    subgraph "CI/CD Pipeline"
+        GH[GitHub]
+        GA[GitHub Actions]
+        Tests[Test Suite]
+        Build[Docker Build]
+    end
+    
+    subgraph "Production"
+        K8s[Kubernetes Cluster]
+        LB[Load Balancer]
+        Pods[API Pods]
+        ProdDB[(PostgreSQL)]
+        ProdKafka[Kafka Cluster]
+    end
+    
+    DevDocker --> GH
+    GH --> GA
+    GA --> Tests
+    Tests --> Build
+    Build --> K8s
+    
+    LB --> Pods
+    Pods --> ProdDB
+    Pods --> ProdKafka
+    
+    style GA fill:#f96,stroke:#333,stroke-width:2px
+    style K8s fill:#9f6,stroke:#333,stroke-width:2px
+```
