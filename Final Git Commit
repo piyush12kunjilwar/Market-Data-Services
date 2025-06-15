@@ -1,0 +1,11 @@
+# Add documentation
+git add docs/
+git add README.md
+git add .env.example
+git add Makefile
+git add .pre-commit-config.yaml
+git add .github/
+git commit -m "Add comprehensive documentation and CI/CD pipeline"
+
+# Final push
+git push origin main
